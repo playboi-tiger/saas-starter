@@ -1,0 +1,482 @@
+/**
+ * GDPR account erasure for the hosted Postgres deployment.
+ *
+ * Dry run (the default):
+ *   pnpm gdpr:erase-user --email person@example.com
+ *
+ * Execute after reviewing the inventory:
+ *   pnpm gdpr:erase-user --email person@example.com \
+ *     --execute --confirm person@example.com \
+ *     --confirm-database-host <host printed by the dry run>
+ *
+ * The Worker endpoint must be deployed with the same GDPR_ERASURE_SECRET as
+ * this process.
+ */
+import process from "node:process";
+import { Autumn } from "autumn-js";
+import {
+  and,
+  count,
+  eq,
+  inArray,
+  ne,
+  notExists,
+  or,
+  sql,
+} from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
+import { drizzle } from "drizzle-orm/postgres-js";
+import postgres from "postgres";
+import { z } from "zod";
+import {
+  GDPR_STORAGE_ERASURE_PATH,
+  signGdprErasureRequest,
+  type GdprStorageErasurePayload,
+} from "../src/shared/gdpr-erasure";
+import { loadLocalEnv, parseArgs } from "./cli-utils";
+// The Node-safe raw barrel (not ../src/db/schema, the provider-aware one,
+// which imports cloudflare:workers).
+import * as schema from "../src/db/pg/schema";
+
+loadLocalEnv();
+
+const args = parseArgs(process.argv.slice(2));
+const execute = args.execute === "true";
+const emailSelector = args.email?.trim().toLowerCase();
+const userIdSelector = args["user-id"]?.trim();
+
+type Db = ReturnType<typeof drizzle>;
+type UserRow = { id: string; email: string; name: string };
+
+function requiredEnv(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) throw new Error(`${name} is required.`);
+  return value;
+}
+
+function optionalEnv(name: string, fallback: string): string {
+  return process.env[name]?.trim() || fallback;
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isNotFound(error: unknown): boolean {
+  const message = errorText(error).toLowerCase();
+  return message.includes("404") || message.includes("not found");
+}
+
+function printUsage(): never {
+  throw new Error(
+    "Pass exactly one selector: --email person@example.com or --user-id <id>. Add --execute --confirm <exact-email> only after reviewing the dry run.",
+  );
+}
+
+async function findUser(db: Db): Promise<UserRow> {
+  if (Boolean(emailSelector) === Boolean(userIdSelector)) printUsage();
+  const rows = await db
+    .select({
+      id: schema.user.id,
+      email: schema.user.email,
+      name: schema.user.name,
+    })
+    .from(schema.user)
+    .where(
+      emailSelector
+        ? sql`lower(${schema.user.email}) = ${emailSelector}`
+        : eq(schema.user.id, userIdSelector ?? ""),
+    )
+    .limit(2);
+  if (rows.length === 0) throw new Error("No matching user found.");
+  if (rows.length !== 1) throw new Error("Selector matched multiple users.");
+  return rows[0];
+}
+
+async function buildInventory(db: Db, user: UserRow) {
+  const allMembers = alias(schema.member, "all_members");
+  const organizations = await db
+    .select({
+      id: schema.organization.id,
+      name: schema.organization.name,
+      memberCount: count(allMembers.id),
+    })
+    .from(schema.member)
+    .innerJoin(
+      schema.organization,
+      eq(schema.organization.id, schema.member.organizationId),
+    )
+    .innerJoin(
+      allMembers,
+      eq(allMembers.organizationId, schema.organization.id),
+    )
+    .where(eq(schema.member.userId, user.id))
+    .groupBy(schema.organization.id, schema.organization.name)
+    .orderBy(schema.organization.id);
+  const shared = organizations.filter(
+    (organization) => organization.memberCount !== 1,
+  );
+  if (shared.length > 0) {
+    throw new Error(
+      `Refusing to erase shared organization(s): ${shared
+        .map(
+          (organization) =>
+            `${organization.id} (${organization.memberCount} members)`,
+        )
+        .join(
+          ", ",
+        )}. Transfer/remove the user and handle shared records explicitly first.`,
+    );
+  }
+  const organizationIds = organizations.map((organization) => organization.id);
+
+  // drizzle's inArray throws on empty arrays, so project-scoped queries are
+  // skipped outright when the user has no organizations or projects.
+  const projects =
+    organizationIds.length === 0
+      ? []
+      : await db
+          .select({ id: schema.projects.id })
+          .from(schema.projects)
+          .where(inArray(schema.projects.organizationId, organizationIds))
+          .orderBy(schema.projects.id);
+  const projectIds = projects.map((row) => row.id);
+
+  const samSessions = await db
+    .select({ id: schema.samSessions.id })
+    .from(schema.samSessions)
+    .where(eq(schema.samSessions.userId, user.id))
+    .orderBy(schema.samSessions.id);
+
+  const databaseCounts = {
+    sessions: await db.$count(
+      schema.session,
+      eq(schema.session.userId, user.id),
+    ),
+    accounts: await db.$count(
+      schema.account,
+      eq(schema.account.userId, user.id),
+    ),
+    onboarding_answers: await db.$count(
+      schema.userOnboardingAnswers,
+      eq(schema.userOnboardingAnswers.userId, user.id),
+    ),
+    projects: projectIds.length,
+    items:
+      projectIds.length === 0
+        ? 0
+        : await db.$count(
+            schema.items,
+            inArray(schema.items.projectId, projectIds),
+          ),
+    sam_sessions: samSessions.length,
+    api_keys: await db.$count(
+      schema.apikey,
+      eq(schema.apikey.referenceId, user.id),
+    ),
+  };
+
+  return {
+    organizations,
+    projectIds,
+    samSessionIds: samSessions.map((row) => row.id),
+    r2Keys: [] as string[],
+    databaseCounts,
+  };
+}
+
+async function deleteLoopsContactBy(selector: {
+  userId?: string;
+  email?: string;
+}) {
+  const response = await fetch("https://app.loops.so/api/v1/contacts/delete", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${requiredEnv("LOOPS_API_KEY")}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(selector),
+  });
+  if (response.status === 404) return "already_absent";
+  if (!response.ok) {
+    throw new Error(
+      `Loops deletion failed (${response.status}): ${await response.text()}`,
+    );
+  }
+  return "deleted";
+}
+
+async function deleteLoopsContact(userId: string, email: string) {
+  return {
+    byUserId: await deleteLoopsContactBy({ userId }),
+    byEmail: await deleteLoopsContactBy({ email }),
+  };
+}
+
+async function deletePostHogPerson(userId: string) {
+  const host = optionalEnv(
+    "POSTHOG_API_HOST",
+    "https://us.posthog.com",
+  ).replace(/\/$/u, "");
+  const projectId = encodeURIComponent(requiredEnv("POSTHOG_PROJECT_ID"));
+  const authorization = `Bearer ${requiredEnv("POSTHOG_PERSONAL_API_KEY")}`;
+  const listUrl = new URL(`${host}/api/projects/${projectId}/persons/`);
+  listUrl.searchParams.set("distinct_id", userId);
+  const listResponse = await fetch(listUrl, {
+    headers: { Authorization: authorization },
+  });
+  if (!listResponse.ok) {
+    throw new Error(
+      `PostHog lookup failed (${listResponse.status}): ${await listResponse.text()}`,
+    );
+  }
+  const people = z
+    .object({
+      results: z.array(
+        z.object({
+          id: z.union([z.string(), z.number()]).optional(),
+          uuid: z.string().optional(),
+        }),
+      ),
+    })
+    .parse(await listResponse.json()).results;
+  for (const person of people) {
+    const personId = person.id ?? person.uuid;
+    if (personId === undefined)
+      throw new Error("PostHog returned a person without an id.");
+    const response = await fetch(
+      `${host}/api/projects/${projectId}/persons/${encodeURIComponent(String(personId))}/?delete_events=true`,
+      { method: "DELETE", headers: { Authorization: authorization } },
+    );
+    if (!response.ok && response.status !== 404) {
+      throw new Error(
+        `PostHog deletion failed (${response.status}): ${await response.text()}`,
+      );
+    }
+  }
+  return people.length;
+}
+
+function autumnEnvironment(): string {
+  const key = process.env.AUTUMN_SECRET_KEY?.trim() ?? "";
+  if (key.startsWith("am_sk_live_")) return "live";
+  if (key.startsWith("am_sk_test_")) return "sandbox";
+  return "unset-or-unknown";
+}
+
+async function deleteAutumnCustomer(organizationIds: string[]) {
+  const autumn = new Autumn({ secretKey: requiredEnv("AUTUMN_SECRET_KEY") });
+  let deleted = 0;
+  let absent = 0;
+  for (const organizationId of organizationIds) {
+    try {
+      await autumn.customers.delete({
+        customerId: organizationId,
+        deleteInStripe: true,
+      });
+      deleted += 1;
+    } catch (error) {
+      if (!isNotFound(error)) throw error;
+      absent += 1;
+    }
+  }
+  return { deleted, absent };
+}
+
+async function eraseWorkerStorage(payload: GdprStorageErasurePayload) {
+  const secret = requiredEnv("GDPR_ERASURE_SECRET");
+  const endpoint = new URL(
+    GDPR_STORAGE_ERASURE_PATH,
+    requiredEnv("BETTER_AUTH_URL"),
+  );
+  if (endpoint.protocol !== "https:") {
+    throw new Error("BETTER_AUTH_URL must use https for GDPR erasure.");
+  }
+  const body = JSON.stringify(payload);
+  const timestamp = String(Date.now());
+  const signature = await signGdprErasureRequest(secret, timestamp, body);
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-gdpr-timestamp": timestamp,
+      "x-gdpr-signature": signature,
+    },
+    body,
+  });
+  const responseBody = await response.text();
+  if (!response.ok) {
+    throw new Error(
+      `Worker storage erasure failed (${response.status}): ${responseBody}`,
+    );
+  }
+  return z
+    .object({ ok: z.literal(true), result: z.record(z.string(), z.unknown()) })
+    .parse(JSON.parse(responseBody) as unknown).result;
+}
+
+async function erasePostgres(db: Db, user: UserRow, organizationIds: string[]) {
+  await db.transaction(async (tx) => {
+    await tx
+      .delete(schema.invitation)
+      .where(sql`lower(${schema.invitation.email}) = lower(${user.email})`);
+    await tx
+      .delete(schema.verification)
+      .where(
+        or(
+          eq(schema.verification.identifier, user.id),
+          eq(schema.verification.value, user.id),
+        ),
+      );
+    await tx
+      .delete(schema.apikey)
+      .where(eq(schema.apikey.referenceId, user.id));
+    if (organizationIds.length > 0) {
+      const deletedOrganizations = await tx
+        .delete(schema.organization)
+        .where(
+          and(
+            inArray(schema.organization.id, organizationIds),
+            notExists(
+              tx
+                .select({ one: sql`1` })
+                .from(schema.member)
+                .where(
+                  and(
+                    eq(schema.member.organizationId, schema.organization.id),
+                    ne(schema.member.userId, user.id),
+                  ),
+                ),
+            ),
+          ),
+        )
+        .returning({ id: schema.organization.id });
+      if (deletedOrganizations.length !== organizationIds.length) {
+        throw new Error(
+          "Organization(s) gained other members since the inventory was taken; aborting the Postgres delete. Re-run after resolving membership.",
+        );
+      }
+    }
+    const deleted = await tx
+      .delete(schema.user)
+      .where(eq(schema.user.id, user.id))
+      .returning({ id: schema.user.id });
+    if (deleted.length !== 1) {
+      throw new Error("Postgres user row disappeared before the final delete.");
+    }
+  });
+}
+
+async function verifyPostgres(
+  db: Db,
+  userId: string,
+  organizationIds: string[],
+) {
+  const userRows = await db.$count(schema.user, eq(schema.user.id, userId));
+  const organizationRows =
+    organizationIds.length === 0
+      ? 0
+      : await db.$count(
+          schema.organization,
+          inArray(schema.organization.id, organizationIds),
+        );
+  if (userRows !== 0 || organizationRows !== 0) {
+    throw new Error(
+      "Postgres verification failed: user or organization rows remain.",
+    );
+  }
+  return { userRows, organizationRows };
+}
+
+async function main() {
+  const connectionString = requiredEnv("POSTGRES_DATABASE_URL");
+  const databaseUrl = new URL(connectionString);
+  if (!["postgres:", "postgresql:"].includes(databaseUrl.protocol)) {
+    throw new Error(
+      "POSTGRES_DATABASE_URL must use postgres:// or postgresql://.",
+    );
+  }
+  const databaseHost = databaseUrl.hostname;
+  const client = postgres(connectionString, { max: 1 });
+  const db = drizzle(client);
+  try {
+    const user = await findUser(db);
+    const inventory = await buildInventory(db, user);
+    const summary = {
+      mode: execute ? "execute" : "dry-run",
+      databaseHost,
+      user: { id: user.id, email: user.email, name: user.name },
+      organizations: inventory.organizations,
+      databaseCounts: inventory.databaseCounts,
+      cloudflare: {
+        samChats: inventory.samSessionIds.length,
+        r2Objects: inventory.r2Keys.length,
+      },
+      external: {
+        loopsContact: true,
+        postHogDistinctId: user.id,
+        autumnCustomersAndStripeCustomers: inventory.organizations.length,
+        autumnEnvironment: autumnEnvironment(),
+      },
+    };
+    console.log(JSON.stringify(summary, null, 2));
+    if (!execute) {
+      console.log(
+        "\nDry run complete. To execute deletion across Postgres, Cloudflare, Loops, PostHog, and Autumn, run:",
+      );
+      console.log(
+        `  pnpm gdpr:erase-user --user-id ${user.id} --execute --confirm ${user.email} --confirm-database-host ${databaseHost}`,
+      );
+      return;
+    }
+
+    if (args.confirm !== user.email) {
+      throw new Error(
+        `--confirm must match the user's email (${user.email}). Got: ${args.confirm}`,
+      );
+    }
+    if (args["confirm-database-host"] !== databaseHost) {
+      throw new Error(
+        `--confirm-database-host must match ${databaseHost}. Got: ${args["confirm-database-host"]}`,
+      );
+    }
+
+    const organizationIds = inventory.organizations.map((org) => org.id);
+    const loops = await deleteLoopsContact(user.id, user.email);
+    const postHogPersonsDeleted = await deletePostHogPerson(user.id);
+    const autumn = await deleteAutumnCustomer(organizationIds);
+    const cloudflare = await eraseWorkerStorage({
+      userId: user.id,
+      email: user.email,
+      organizationIds,
+      projectIds: inventory.projectIds,
+      samSessionIds: inventory.samSessionIds,
+      r2Keys: inventory.r2Keys,
+    });
+    await erasePostgres(db, user, organizationIds);
+    const postgresVerification = await verifyPostgres(
+      db,
+      user.id,
+      organizationIds,
+    );
+
+    const receipt = {
+      status: "completed",
+      user: { id: user.id, email: user.email },
+      loops,
+      postHog: { personsDeleted: postHogPersonsDeleted },
+      autumn,
+      cloudflare,
+      postgresVerification,
+      completedAt: new Date().toISOString(),
+    };
+    console.log(JSON.stringify(receipt, null, 2));
+  } finally {
+    await client.end();
+  }
+}
+
+main().catch((error) => {
+  console.error("ERASURE FAILED:", errorText(error));
+  process.exit(1);
+});
